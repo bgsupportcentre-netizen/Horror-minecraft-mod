@@ -1,5 +1,182 @@
 --!nocheck
 --[[
+    Layer 2 anti-skid runtime (expanded)
+    -------------------------------------
+    Paste this block at the VERY TOP of your UI library source (before any
+    other code runs).
+
+    IMPORTANT — honest limits, read before relying on this:
+      - This cannot stop someone from VIEWING decompiled source in an
+        executor's built-in script explorer/debugger panel. That happens
+        at the executor/engine level, before any of your Lua runs. No
+        script can intercept that.
+      - A sufficiently determined skidder who reads THIS file can write
+        around parts of it (e.g. capture real function references before
+        your script loads, in some executors). This raises the cost of
+        extraction significantly; it does not make it impossible.
+      - Treat this as one layer among several (layer 1 = loader gating,
+        layer 2 = this, layer 3 = TBD source-hardening), not a silver bullet.
+
+    REQUIRED: the Roblox-side loader snippet must set a matching token
+    BEFORE calling loadstring, or this script refuses to run:
+
+        getgenv().__ARIOS_TOKEN = "SAME_VALUE_AS_LOAD_TOKEN_BELOW"
+        local res = request({
+            Url = "https://arios-lib.netlify.app/arios_library.lua",
+            Method = "GET",
+            Headers = { ["X-Loader-Key"] = "YOUR_LOADER_KEY" }
+        })
+        loadstring(res.Body)()
+
+    This means a raw copy of the dumped source, run on its own without
+    going through that exact flow, won't do anything but self-kick.
+]]
+
+-- ---- CONFIG -------------------------------------------------------------
+local FAKE_MESSAGE = "Suspicious attempts to modify internal codes detected"
+local LOAD_TOKEN = "CHANGE_ME_TO_A_LONG_RANDOM_STRING" -- must match __ARIOS_TOKEN
+local EXFIL_CANARY = "ARIOS_SRC_CANARY_CHANGE_ME"       -- unique per-build marker
+-- ---------------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local function punish()
+    warn("[antiskid] " .. FAKE_MESSAGE)
+    if LocalPlayer then
+        pcall(function() LocalPlayer:Kick(FAKE_MESSAGE) end)
+    end
+end
+
+-- 0. Load-token gate: refuse to run at all if this wasn't loaded through
+--    the real flow.
+if env.__ARIOS_TOKEN ~= LOAD_TOKEN then
+    punish()
+    return
+end
+
+-- Keep real references so hooked functions can still "succeed" from the
+-- caller's point of view (clipboard/file gets FAKE_MESSAGE, not an error).
+local realFns = {
+    setclipboard      = env.setclipboard or env.toclipboard,
+    writefile         = env.writefile,
+    appendfile        = env.appendfile,
+    getscriptbytecode = env.getscriptbytecode,
+    getscriptclosure  = env.getscriptclosure,
+    getsenv           = env.getsenv,
+    decompile         = env.decompile,
+    request           = env.request or env.http_request or (env.syn and env.syn.request),
+}
+
+local function hookClipboard()
+    local target = env.setclipboard and "setclipboard"
+        or (env.toclipboard and "toclipboard")
+    if not target then return end
+    env[target] = function(...)
+        punish()
+        if realFns.setclipboard then pcall(realFns.setclipboard, FAKE_MESSAGE) end
+    end
+end
+
+local function hookFile(name)
+    if not env[name] then return end
+    env[name] = function(filename, ...)
+        punish()
+        if realFns[name] then pcall(realFns[name], filename, FAKE_MESSAGE) end
+    end
+end
+
+-- 1. Hook the actual dump/decompile functions, not just export-side ones.
+local function hookDumpFns()
+    for _, name in ipairs({ "getscriptbytecode", "getscriptclosure", "getsenv", "decompile" }) do
+        if env[name] then
+            env[name] = function(...)
+                punish()
+                return nil
+            end
+        end
+    end
+end
+
+-- 2. Webhook/exfiltration detection: block outgoing HTTP calls whose body
+--    contains our canary string (i.e. someone trying to ship the dumped
+--    source off to a webhook or external server).
+local function containsCanary(value)
+    if typeof(value) ~= "string" then return false end
+    return string.find(value, EXFIL_CANARY, 1, true) ~= nil
+end
+
+local function hookRequest()
+    local name = env.request and "request"
+        or (env.http_request and "http_request")
+        or nil
+    if name then
+        local real = realFns.request
+        env[name] = function(options, ...)
+            if typeof(options) == "table" then
+                if containsCanary(options.Body) or containsCanary(options.body) then
+                    punish()
+                    return { StatusCode = 403, Body = "" }
+                end
+            end
+            return real(options, ...)
+        end
+    end
+    if env.syn and env.syn.request and realFns.request then
+        local real = realFns.request
+        env.syn.request = function(options, ...)
+            if typeof(options) == "table" and (containsCanary(options.Body) or containsCanary(options.body)) then
+                punish()
+                return { StatusCode = 403, Body = "" }
+            end
+            return real(options, ...)
+        end
+    end
+end
+
+local function applyHooks()
+    hookClipboard()
+    hookFile("writefile")
+    hookFile("appendfile")
+    hookDumpFns()
+    hookRequest()
+end
+
+applyHooks()
+
+-- 3. Hook-integrity watchdog: detect when a hook has been reverted back
+--    to something that isn't ours (i.e. someone restored the original),
+--    and treat that detection itself as suspicious, not just a reason to
+--    silently re-patch.
+local guardedNames = { "setclipboard", "toclipboard", "writefile", "appendfile" }
+local lastKnownHooks = {}
+for _, name in ipairs(guardedNames) do
+    lastKnownHooks[name] = env[name]
+end
+
+task.spawn(function()
+    while true do
+        task.wait(3)
+        local tampered = false
+        for _, name in ipairs(guardedNames) do
+            if env[name] ~= nil and env[name] ~= lastKnownHooks[name] then
+                tampered = true
+            end
+        end
+        if tampered then
+            punish()
+            break
+        end
+        local ok = pcall(applyHooks)
+        if not ok then break end
+        for _, name in ipairs(guardedNames) do
+            lastKnownHooks[name] = env[name]
+        end
+    end
+end)
+
+--[[
 	SINGULARITY  //  event horizon interface for Roblox                    v2.0
 	-------------------------------------------------------------------------
 	Floating glass panels over a live, ray-marched black hole. Every callback is
